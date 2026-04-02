@@ -68,6 +68,7 @@ pub struct StoredCredentials {
     pub granted_scopes: Vec<String>,
     #[serde(default)]
     pub token_received_at: Option<u64>,
+    pub client_secret: Option<String>,
 }
 
 impl std::fmt::Debug for StoredCredentials {
@@ -91,12 +92,14 @@ impl StoredCredentials {
         token_response: Option<OAuthTokenResponse>,
         granted_scopes: Vec<String>,
         token_received_at: Option<u64>,
+        client_secret: Option<String>,
     ) -> Self {
         Self {
             client_id,
             token_response,
             granted_scopes,
             token_received_at,
+            client_secret,
         }
     }
 }
@@ -157,6 +160,7 @@ pub struct StoredAuthorizationState {
     pub pkce_verifier: String,
     pub csrf_token: String,
     pub created_at: u64,
+    pub client_secret: Option<String>,
 }
 
 impl std::fmt::Debug for StoredAuthorizationState {
@@ -205,6 +209,7 @@ impl StoredAuthorizationState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            client_secret: None,
         }
     }
 
@@ -602,7 +607,10 @@ impl Default for ScopeUpgradeConfig {
 pub struct AuthorizationManager {
     http_client: HttpClient,
     metadata: Option<AuthorizationMetadata>,
-    oauth_client: Option<OAuthClient>,
+    oauth_client: Arc<Mutex<Option<OAuthClient>>>,
+    /// A copy of the OAuth client secret, so it can be used when constructing
+    /// new OAuthClient instances
+    client_secret: Option<String>,
     credential_store: Arc<dyn CredentialStore>,
     state_store: Arc<dyn StateStore>,
     base_url: Url,
@@ -698,7 +706,8 @@ impl AuthorizationManager {
         let manager = Self {
             http_client,
             metadata: None,
-            oauth_client: None,
+            oauth_client: Arc::new(Mutex::new(None)),
+            client_secret: None,
             credential_store: Arc::new(InMemoryCredentialStore::new()),
             state_store: Arc::new(InMemoryStateStore::new()),
             base_url,
@@ -754,6 +763,7 @@ impl AuthorizationManager {
                 }
 
                 self.configure_client_id(&stored.client_id)?;
+                self.client_secret = stored.client_secret.clone();
                 return Ok(true);
             }
         }
@@ -782,8 +792,8 @@ impl AuthorizationManager {
 
     /// get client id and credentials
     pub async fn get_credentials(&self) -> Result<Credentials, AuthError> {
-        let client_id = self
-            .oauth_client
+        let oauth_client = self.oauth_client.lock().await;
+        let client_id = oauth_client
             .as_ref()
             .ok_or_else(|| AuthError::InternalError("OAuth client not configured".to_string()))?
             .client_id();
@@ -817,6 +827,7 @@ impl AuthorizationManager {
             .set_token_uri(token_url)
             .set_redirect_uri(redirect_url);
 
+        self.client_secret = config.client_secret.clone();
         if let Some(secret) = config.client_secret {
             client_builder = client_builder.set_client_secret(ClientSecret::new(secret));
         }
@@ -838,7 +849,7 @@ impl AuthorizationManager {
             client_builder = client_builder.set_auth_type(AuthType::RequestBody);
         }
 
-        self.oauth_client = Some(client_builder);
+        *self.oauth_client.try_lock().unwrap() = Some(client_builder);
         Ok(())
     }
     /// validate authorization server metadata before starting authorization.
@@ -978,8 +989,8 @@ impl AuthorizationManager {
 
     /// generate authorization url
     pub async fn get_authorization_url(&self, scopes: &[&str]) -> Result<String, AuthError> {
-        let oauth_client = self
-            .oauth_client
+        let oauth_client = self.oauth_client.lock().await;
+        let oauth_client = oauth_client
             .as_ref()
             .ok_or_else(|| AuthError::InternalError("OAuth client not configured".to_string()))?;
         self.validate_server_metadata("code")?;
@@ -1147,8 +1158,8 @@ impl AuthorizationManager {
         csrf_token: &str,
     ) -> Result<OAuthTokenResponse, AuthError> {
         debug!("start exchange code for token: {:?}", code);
-        let oauth_client = self
-            .oauth_client
+        let oauth_client = self.oauth_client.lock().await;
+        let oauth_client = oauth_client
             .as_ref()
             .ok_or_else(|| AuthError::InternalError("OAuth client not configured".to_string()))?;
 
@@ -1169,6 +1180,9 @@ impl AuthorizationManager {
             .build()
             .map_err(|e| AuthError::InternalError(e.to_string()))?;
         debug!("client_id: {:?}", oauth_client.client_id());
+
+        // TODO: Inject client secret here, or will the OAuth client already
+        // have it loaded from the credential store or state?
 
         // exchange token
         let token_result = match oauth_client
@@ -1213,6 +1227,7 @@ impl AuthorizationManager {
             token_response: Some(token_result.clone()),
             granted_scopes,
             token_received_at: Some(Self::now_epoch_secs()),
+            client_secret: self.client_secret.clone(),
         };
         self.credential_store.save(stored).await?;
 
@@ -1285,17 +1300,23 @@ impl AuthorizationManager {
 
     /// refresh access token
     pub async fn refresh_token(&self) -> Result<OAuthTokenResponse, AuthError> {
-        let oauth_client = self
-            .oauth_client
-            .as_ref()
+        let mut oauth_client = self.oauth_client.lock().await;
+        let oauth_client = oauth_client
+            .as_mut()
             .ok_or_else(|| AuthError::InternalError("OAuth client not configured".to_string()))?;
 
         let stored = self.credential_store.load().await?;
         let stored_credentials = stored.ok_or(AuthError::AuthorizationRequired)?;
+
+        if let Some(client_secret) = &stored_credentials.client_secret {
+            *oauth_client = oauth_client
+                .clone()
+                .set_client_secret(ClientSecret::new(client_secret.clone()));
+        }
+
         let current_credentials = stored_credentials
             .token_response
             .ok_or(AuthError::AuthorizationRequired)?;
-
         let refresh_token = current_credentials.refresh_token().ok_or_else(|| {
             AuthError::TokenRefreshFailed("No refresh token available".to_string())
         })?;
@@ -1324,6 +1345,7 @@ impl AuthorizationManager {
             token_response: Some(token_result.clone()),
             granted_scopes,
             token_received_at: Some(Self::now_epoch_secs()),
+            client_secret: self.client_secret.clone(),
         };
         self.credential_store.save(stored).await?;
 
@@ -1849,7 +1871,7 @@ impl AuthorizationManager {
             }
         }
 
-        self.oauth_client = Some(client_builder);
+        *self.oauth_client.try_lock().unwrap() = Some(client_builder);
         Ok(())
     }
 
@@ -1876,10 +1898,17 @@ impl AuthorizationManager {
             return self.exchange_client_credentials_jwt(config).await;
         }
 
-        let oauth_client = self
-            .oauth_client
-            .as_ref()
+        let mut oauth_client = self.oauth_client.lock().await;
+        let oauth_client = oauth_client
+            .as_mut()
             .ok_or_else(|| AuthError::InternalError("OAuth client not configured".to_string()))?;
+
+        // // TODO: Should client_secret be injected into this request or not?
+        // if let Some(client_secret) = &self.client_secret {
+        //     *oauth_client = 
+        //         oauth_client.clone()
+        //             .set_client_secret(ClientSecret::new(client_secret.clone()));
+        // }
 
         let mut request = oauth_client.exchange_client_credentials();
 
@@ -1940,6 +1969,7 @@ impl AuthorizationManager {
             token_response: Some(token_result.clone()),
             granted_scopes,
             token_received_at: Some(Self::now_epoch_secs()),
+            client_secret: self.client_secret.clone(),
         };
         self.credential_store.save(stored).await?;
 
@@ -2304,6 +2334,7 @@ impl OAuthState {
         &mut self,
         client_id: &str,
         credentials: OAuthTokenResponse,
+        client_secret: Option<String>,
     ) -> Result<(), AuthError> {
         if let OAuthState::Unauthorized(manager) = self {
             let mut manager = std::mem::replace(
@@ -2323,6 +2354,7 @@ impl OAuthState {
                 token_response: Some(credentials),
                 granted_scopes,
                 token_received_at: Some(AuthorizationManager::now_epoch_secs()),
+                client_secret: client_secret,
             };
             manager.credential_store.save(stored).await?;
 
