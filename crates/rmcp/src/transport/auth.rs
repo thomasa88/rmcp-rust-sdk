@@ -2340,6 +2340,36 @@ impl OAuthState {
         }
     }
 
+    pub fn set_credential_store<S: CredentialStore + 'static>(&mut self, store: S) {
+        match self {
+            OAuthState::Unauthorized(manager) | OAuthState::Authorized(manager) => {
+                manager.set_credential_store(store);
+            }
+            OAuthState::Session(session) => {
+                session.auth_manager.set_credential_store(store);
+            }
+            OAuthState::AuthorizedHttpClient(_client) => {
+                todo!(
+                    "Setting credential store on an authorized HTTP client is not currently supported"
+                );
+            }
+        }
+    }
+
+    pub async fn initialize_from_store(&mut self) -> Result<bool, AuthError> {
+        match self {
+            OAuthState::Unauthorized(manager) | OAuthState::Authorized(manager) => {
+                manager.initialize_from_store().await
+            }
+            OAuthState::Session(session) => session.auth_manager.initialize_from_store().await,
+            OAuthState::AuthorizedHttpClient(_client) => {
+                todo!(
+                    "Initializing from store on an authorized HTTP client is not currently supported"
+                );
+            }
+        }
+    }
+
     /// start authorization
     pub async fn start_authorization(
         &mut self,
